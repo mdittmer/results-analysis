@@ -188,7 +188,8 @@ func main() {
 
 	readStartTime := time.Now()
 	runs := base.FetchLatestRuns(*wptdHost)
-	allResults := storage.LoadTestRunResults(&inputCtx, runs, *pretty)
+	allResults := storage.LoadTestRunResults(&inputCtx, runs,
+		storage.GCSLimiter(), *pretty)
 	readEndTime := time.Now()
 
 	log.Println("Read test results from Google Cloud Storage bucket: " +

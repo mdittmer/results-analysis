@@ -32,6 +32,20 @@ var (
 	limiter = rate.NewLimiter(50, 50)
 )
 
+type Limiter interface {
+	Wait(context.Context)
+}
+
+type limiterStruct rate.Limiter
+
+func (l *limiterStruct) Wait(ctx context.Context) {
+	l.Wait(ctx)
+}
+
+func GCSLimiter() Limiter {
+	return (*limiterStruct)(limiter)
+}
+
 type OutputLocation struct {
 	GCSObjectPath string
 	BQDatasetName string
@@ -264,7 +278,7 @@ func (ctx BQContext) Output(id OutputId, metadata interface{},
 // Load (test run, test results) pairs for given test runs. Use client in
 // context to load data from bucket.
 func LoadTestRunResults(ctx *GCSDatastoreContext, runs []base.TestRun,
-	pretty bool) (runResults []metrics.TestRunResults) {
+	limiter Limiter, pretty bool) (runResults []metrics.TestRunResults) {
 	resultChan := make(chan metrics.TestRunResults, 0)
 	errChan := make(chan error, 0)
 	runResults = make([]metrics.TestRunResults, 0, 100000)
@@ -278,7 +292,7 @@ func LoadTestRunResults(ctx *GCSDatastoreContext, runs []base.TestRun,
 		for _, run := range runs {
 			go func(run base.TestRun) {
 				defer wg.Done()
-				processTestRun(ctx, &run, resultChan, errChan)
+				processTestRun(ctx, &run, limiter, resultChan, errChan)
 			}(run)
 		}
 		wg.Wait()
@@ -342,7 +356,7 @@ func LoadTestRunResults(ctx *GCSDatastoreContext, runs []base.TestRun,
 }
 
 func processTestRun(ctx *GCSDatastoreContext, testRun *base.TestRun,
-	resultChan chan metrics.TestRunResults, errChan chan error) {
+	limiter Limiter, resultChan chan metrics.TestRunResults, errChan chan error) {
 	resultsURL := testRun.ResultsURL
 
 	// summaryURL format:
@@ -388,7 +402,7 @@ func processTestRun(ctx *GCSDatastoreContext, testRun *base.TestRun,
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			loadTestResults(ctx, testRun, attrs.Name, resultChan,
+			loadTestResults(ctx, testRun, attrs.Name, limiter, resultChan,
 				errChan)
 		}()
 	}
@@ -397,10 +411,12 @@ func processTestRun(ctx *GCSDatastoreContext, testRun *base.TestRun,
 }
 
 func loadTestResults(ctx *GCSDatastoreContext, testRun *base.TestRun,
-	objName string, resultChan chan metrics.TestRunResults,
+	objName string, limiter Limiter, resultChan chan metrics.TestRunResults,
 	errChan chan error) {
 	// Rate limit.
-	limiter.Wait(ctx.Context)
+	if limiter != nil {
+		limiter.Wait(ctx.Context)
+	}
 
 	// Read object from GCS
 	obj := ctx.Bucket.Handle.Object(objName)

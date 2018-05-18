@@ -1,23 +1,30 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
-	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"strings"
 	"sync"
-
-	"gopkg.in/src-d/go-git.v4/plumbing/object"
+	"time"
 
 	"cloud.google.com/go/datastore"
+	gcs "cloud.google.com/go/storage"
+	"github.com/web-platform-tests/results-analysis/metrics"
+	wptStorage "github.com/web-platform-tests/results-analysis/metrics/storage"
 	"github.com/web-platform-tests/wpt.fyi/shared"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
@@ -30,20 +37,16 @@ import (
 
 var wptGitPath *string
 var wptDataPath *string
-var projectId *string
+var projectID *string
 var inputGcsBucket *string
 var outputGcsBucket *string
 var wptdHost *string
 var gcpCredentialsFile *string
 
-type byHash []*object.Commit
+type tr struct {
+	Hash string
 
-func (c byHash) Len() int          { return len(c) }
-func (c byHash) Swap(i int, j int) { c[i], c[j] = c[j], c[i] }
-func (c byHash) Less(i int, j int) bool {
-	hi := c[i].Hash[0:]
-	hj := c[j].Hash[0:]
-	return bytes.Compare(hi, hj) == -1
+	shared.TestRun
 }
 
 func init() {
@@ -55,17 +58,17 @@ func init() {
 	defaultDataDir := filepath.Clean(path.Dir(srcFilePath) + "/../../.cache/migration")
 	wptGitPath = flag.String("wpt_git_path", defaultGitDir, "Path to WPT checkout")
 	wptDataPath = flag.String("wpt_data_path", defaultDataDir, "Path to data directory for local data from Google Cloud Storage")
-	projectId = flag.String("project_id", "wptdashboard", "Google Cloud Platform project id")
+	projectID = flag.String("project_id", "wptdashboard", "Google Cloud Platform project id")
 	inputGcsBucket = flag.String("input_gcs_bucket", "wptd", "Google Cloud Storage bucket where shareded test results are stored")
-	outputGcsBucket = flag.String("output_gcs_bucket", "wptd-metrics", "Google Cloud Storage bucket where unified test results are stored")
+	outputGcsBucket = flag.String("output_gcs_bucket", "wptd-results", "Google Cloud Storage bucket where unified test results are stored")
 	wptdHost = flag.String("wptd_host", "wpt.fyi", "Hostname of endpoint that serves WPT Dashboard data API")
 	gcpCredentialsFile = flag.String("gcp_credentials_file", "client-secret.json", "Path to credentials file for authenticating against Google Cloud Platform services")
 }
 
-func getRuns(ctx context.Context, client *datastore.Client) []shared.TestRun {
+func getRuns(ctx wptStorage.GCSDatastoreContext) []shared.TestRun {
 	query := datastore.NewQuery("TestRun").Order("-CreatedAt")
 	testRuns := make([]shared.TestRun, 0)
-	it := client.Run(ctx, query)
+	it := ctx.Client.Run(ctx.Context, query)
 	for {
 		var testRun shared.TestRun
 		_, err := it.Next(&testRun)
@@ -96,72 +99,238 @@ func getGit(s storage.Storer, fs billy.Filesystem, o *git.CloneOptions) *git.Rep
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err = wt.Pull(&git.PullOptions{}); err != git.NoErrAlreadyUpToDate && err != nil {
-		log.Fatal(err)
+
+	for {
+		err = wt.Pull(&git.PullOptions{})
+
+		if err == io.EOF {
+			log.Println("EOF during git pull; retrying...")
+			continue
+		} else if err != git.NoErrAlreadyUpToDate && err != nil {
+			log.Fatal(err)
+		} else {
+			break
+		}
 	}
 	return repo
 }
 
-func findHash(commits []*object.Commit, shortHash []byte) int {
-	mid := len(commits) / 2
-	if len(commits) == 0 {
-		return -1
+func getHashForRun(run shared.TestRun) (string, error) {
+	cmd := exec.Command("git", "rev-parse", run.Revision)
+	cmd.Dir = *wptGitPath
+	bytes, err := cmd.Output()
+	if err != nil {
+		return "", err
 	}
-	commitHash := commits[mid].Hash[len(commits[mid].Hash)-5:]
-	cmp := bytes.Compare(commitHash, shortHash)
-	switch {
-	case cmp == 1:
-		return findHash(commits[:mid], shortHash)
-	case cmp == -1:
-		return findHash(commits[mid+1:], shortHash) + mid + 1
-	default:
-		return mid
-	}
+	str := string(bytes)
+	return strings.Trim(str, " \t\r\n\v"), nil
 }
 
-func getCommitForRuns(repo *git.Repository, runs []shared.TestRun) []*object.Commit {
-	log.Println("Gathering commits")
-	iter, err := repo.CommitObjects()
-	if err != nil {
-		log.Fatal(err)
-	}
-	commits := make([]*object.Commit, 0)
-	var commit *object.Commit
-	for commit, err = iter.Next(); commit != nil; commit, err = iter.Next() {
-		commits = append(commits, commit)
-	}
-	if err != io.EOF {
-		log.Fatal(err)
-	}
-	log.Println("Sorting commits")
-	sort.Sort(byHash(commits))
+func getRunsAndSetupGit(ctx wptStorage.GCSDatastoreContext) []shared.TestRun {
+	var wg sync.WaitGroup
+	var runs []shared.TestRun
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		runs = getRuns(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		fs := osfs.New(*wptGitPath)
+		store, err := filesystem.NewStorage(osfs.New(*wptGitPath + "/.git"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		getGit(store, fs, &git.CloneOptions{
+			URL: "https://github.com/w3c/web-platform-tests.git",
+		})
+	}()
+	wg.Wait()
 
-	log.Println("Matching commits")
-	found := make([]*object.Commit, len(runs), len(runs))
+	return runs
+}
+
+func getHashes(runs []shared.TestRun) (map[string]string, map[string]error) {
+	errs := make(map[string]error)
+	hashes := make(map[string]string)
 	var wg sync.WaitGroup
 	wg.Add(len(runs))
 	for i, run := range runs {
 		go func(i int, run shared.TestRun) {
 			defer wg.Done()
-			runHash, err := hex.DecodeString(run.Revision)
-			if err != nil {
-				log.Fatal(err)
-			}
-			if len(runHash) != 5 {
-				log.Fatalf("Unexpected hash length: %d bytes", len(runHash))
-			}
-			idx := findHash(commits, runHash)
-			if idx == -1 {
-				log.Printf("Failed to find revision for %s", run.Revision)
+			h := run.Revision
+			if _, ok := hashes[h]; ok {
 				return
 			}
-			log.Printf("Found commit for %s", run.Revision)
-			found[i] = commits[idx]
+			hashes[h], errs[h] = getHashForRun(run)
 		}(i, run)
 	}
 	wg.Wait()
 
-	return found
+	return hashes, errs
+}
+
+func loadResultShard(ctx context.Context, bucket *gcs.BucketHandle, run tr, objName string, resultChan chan interface{}, errChan chan error) {
+	// Read object from GCS.
+	obj := bucket.Object(objName)
+	reader, err := obj.NewReader(ctx)
+	if err != nil {
+		errChan <- err
+		return
+	}
+	defer reader.Close()
+	data, err := ioutil.ReadAll(reader)
+	if err != nil {
+		errChan <- err
+		return
+	}
+
+	// Unmarshal JSON, which may be gzipped.
+	var anyResult interface{}
+	if err := json.Unmarshal(data, &anyResult); err != nil {
+		reader2 := bytes.NewReader(data)
+		reader3, err := gzip.NewReader(reader2)
+		if err != nil {
+			errChan <- err
+			return
+		}
+		defer reader3.Close()
+		unzippedData, err := ioutil.ReadAll(reader3)
+		if err != nil {
+			errChan <- err
+			return
+		}
+		if err := json.Unmarshal(unzippedData, &anyResult); err != nil {
+			errChan <- err
+			return
+		}
+	}
+	resultChan <- anyResult
+}
+
+func loadResults(ctx context.Context, client *gcs.Client, bucket *gcs.BucketHandle, run tr) (chan interface{}, chan error) {
+	resultsURL := run.ResultsURL
+
+	// TODO(markdittmer): Below is almost verbatim from
+	// metrics/storage/storage.go. Perhaps refactor into common code path.
+
+	// summaryURL format:
+	//
+	// protocol://host/bucket/dir/path-summary.json.gz
+	//
+	// where results are stored in
+	//
+	// protocol://host/bucket/dir/path/**
+	//
+	// Desired bucket-relative GCS prefix:
+	//
+	// dir/path/
+	prefixSliceStart := strings.Index(resultsURL, *inputGcsBucket) +
+		len(*inputGcsBucket) + 1
+	prefixSliceEnd := strings.LastIndex(resultsURL, "-")
+	prefix := resultsURL[prefixSliceStart:prefixSliceEnd] + "/"
+
+	// Get objects with desired prefix, process them in parallel, then
+	// return.
+	it := bucket.Objects(ctx, &gcs.Query{
+		Prefix: prefix,
+	})
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	resultChan := make(chan interface{}, 0)
+	errChan := make(chan error, 0)
+
+	{
+		defer close(resultChan)
+		defer close(errChan)
+
+		for {
+			var err error
+			attrs, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				errChan <- err
+				continue
+			}
+
+			// Skip directories.
+			if attrs.Name == "" {
+				continue
+			}
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				loadResultShard(ctx, bucket, run, attrs.Name, resultChan, errChan)
+			}()
+		}
+
+		wg.Done()
+		wg.Wait()
+	}
+
+	return resultChan, errChan
+}
+
+func writeJSON(ctx context.Context, bucket *gcs.BucketHandle, path string, data interface{}) error {
+	obj := bucket.Object(path)
+	if err := func() error {
+		objWriter := obj.NewWriter(ctx)
+		gzWriter := gzip.NewWriter(objWriter)
+		encoder := json.NewEncoder(gzWriter)
+
+		objWriter.ContentType = "application/json"
+		objWriter.ContentEncoding = "gzip"
+
+		if err := encoder.Encode(data); err != nil {
+			objWriter.CloseWithError(err)
+			return err
+		}
+
+		if err := gzWriter.Close(); err != nil {
+			return err
+		}
+		return objWriter.Close()
+	}(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func streamData(ctx context.Context, bucket *gcs.BucketHandle, path string, reader io.Reader) error {
+	obj := bucket.Object(path)
+	if err := func() error {
+		objWriter := obj.NewWriter(ctx)
+		gzWriter := gzip.NewWriter(objWriter)
+		scanner := bufio.NewScanner(reader)
+
+		objWriter.ContentType = "text/plain"
+		objWriter.ContentEncoding = "gzip"
+
+		for scanner.Scan() {
+			if _, err := gzWriter.Write([]byte(scanner.Text() + "\n")); err != nil {
+				objWriter.CloseWithError(err)
+				return err
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			objWriter.CloseWithError(err)
+			return err
+		}
+
+		if err := gzWriter.Close(); err != nil {
+			return err
+		}
+		return objWriter.Close()
+	}(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func main() {
@@ -175,35 +344,105 @@ func main() {
 	}
 
 	ctx := context.Background()
-	datastoreClient, err := datastore.NewClient(ctx, *projectId, option.WithCredentialsFile(*gcpCredentialsFile))
+	datastoreClient, err := datastore.NewClient(ctx, *projectID, option.WithCredentialsFile(*gcpCredentialsFile))
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	var wg sync.WaitGroup
-	var runs []shared.TestRun
-	var repo *git.Repository
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		runs = getRuns(ctx, datastoreClient)
-	}()
-	go func() {
-		defer wg.Done()
-		fs := osfs.New(*wptGitPath)
-		store, err := filesystem.NewStorage(osfs.New(*wptGitPath + "/.git"))
+	storageClient, err := gcs.NewClient(ctx, option.WithCredentialsFile(*gcpCredentialsFile))
+	if err != nil {
+		log.Fatal(err)
+	}
+	inputBucket := storageClient.Bucket(*inputGcsBucket)
+
+	remoteCtx := wptStorage.GCSDatastoreContext{
+		ctx,
+		wptStorage.Bucket{
+			*inputGcsBucket,
+			inputBucket,
+		},
+		datastoreClient,
+	}
+
+	log.Printf("Loading runs from Datastore and initializing local web-platform-tests checkout")
+	testRuns := getRunsAndSetupGit(remoteCtx)
+	outputBucket := storageClient.Bucket(*outputGcsBucket)
+
+	for _, testRun := range testRuns {
+		hash, err := getHashForRun(testRun)
+		if err != nil {
+			log.Printf("Skipping run for unknown revision: %v", testRun)
+			continue
+		}
+
+		// Check for remote log file as signal that this run was already handled.
+		log.Printf("Checking for existing consolidated run for %v", testRun)
+		bucketDir := fmt.Sprintf("%s/%s_%s_%s_%s", hash, testRun.BrowserName, testRun.BrowserVersion, testRun.OSName, testRun.OSVersion)
+		remoteLogPath := bucketDir + "/migration.log"
+		_, err = outputBucket.Object(remoteLogPath).Attrs(ctx)
+		if err != nil && err != gcs.ErrObjectNotExist {
+			log.Fatal(err)
+		}
+		if err == nil {
+			log.Printf("Skipping revision: Found log file for revision: %v", testRun)
+			continue
+		}
+
+		// Create local log file for this run.
+		localLogFileName := fmt.Sprintf("%s_%s_%s_%s_%s_migration.log", hash, testRun.BrowserName, testRun.BrowserVersion, testRun.OSName, testRun.OSVersion)
+		log.Printf("Opening local run-specific log file %s", localLogFileName)
+		logFile, err := os.OpenFile(localLogFileName, os.O_CREATE|os.O_WRONLY, 0666)
 		if err != nil {
 			log.Fatal(err)
 		}
-		repo = getGit(store, fs, &git.CloneOptions{
-			URL: "https://github.com/w3c/web-platform-tests.git",
-		})
-	}()
 
-	wg.Wait()
+		// Download sharded run, consolidate it, upload consolidated run.
+		{
+			defer logFile.Close()
+			log.Printf("Downloading, consolidating, and uploading %v", testRun)
+			log.Printf("Logging to %s", localLogFileName)
+			log.SetOutput(logFile)
 
-	getCommitForRuns(repo, runs)
-	//for _, commit := range commits {
-	//log.Printf("Found commit %v", commit)
-	//}
+			log.Printf("Loading results from %s for %v", remoteCtx.Bucket.Name, testRun)
+			runResults := wptStorage.LoadTestRunResults(&remoteCtx, []shared.TestRun{testRun}, nil, false)
+			log.Printf("Consolidating metrics for %v", testRun)
+			results := make([]*metrics.TestResults, 0, len(runResults))
+			for _, rr := range runResults {
+				results = append(results, rr.Res)
+			}
+			report := metrics.TestResultsReport{results}
+
+			remoteReportPath := bucketDir + "/report.json"
+			log.Printf("Writing consolidated results to %s/%s", *outputGcsBucket, remoteReportPath)
+			if err = writeJSON(ctx, outputBucket, remoteReportPath, report); err != nil {
+				log.Printf("Error writing %s to Google Cloud Storage: %v\n", remoteReportPath, err)
+				log.SetOutput(os.Stdout)
+				continue
+			}
+
+			log.SetOutput(os.Stdout)
+		}
+
+		// Re-open local log file for streaming to GCS.
+		log.Printf("Opening %s for reading", localLogFileName)
+		logFile, err = os.OpenFile(localLogFileName, os.O_RDONLY, 0666)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		// Stream log file to GCS.
+		{
+			defer logFile.Close()
+			log.Printf("Streaming %s to GCS object: %s", localLogFileName, remoteLogPath)
+			if err := streamData(ctx, outputBucket, remoteLogPath, logFile); err != nil {
+				log.Printf("Error streaming log to Google Cloud Storage: %v\n", err)
+			}
+			if err := logFile.Close(); err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		// Wait a minute to avoid being throttled by GCS.
+		time.Sleep(time.Minute)
+	}
 }
