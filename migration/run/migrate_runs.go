@@ -317,7 +317,7 @@ func main() {
 		}
 
 		// Update TestRun in Datastore.
-		if testRun.RevisionHash == nil {
+		if testRun.RevisionHash == "" {
 			testRun.RevisionHash = hash
 			testRun.RawResultsURL = fmt.Sprintf("https://storage.googleapis.com/%s/%s", *outputGcsBucket, remoteReportPath)
 			_, err := datastoreClient.Put(ctx, datastoreKey, testRun)
