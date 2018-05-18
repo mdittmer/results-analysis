@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -10,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -43,12 +41,6 @@ var outputGcsBucket *string
 var wptdHost *string
 var gcpCredentialsFile *string
 
-type tr struct {
-	Hash string
-
-	shared.TestRun
-}
-
 func init() {
 	_, srcFilePath, _, ok := runtime.Caller(0)
 	if !ok {
@@ -65,22 +57,24 @@ func init() {
 	gcpCredentialsFile = flag.String("gcp_credentials_file", "client-secret.json", "Path to credentials file for authenticating against Google Cloud Platform services")
 }
 
-func getRuns(ctx wptStorage.GCSDatastoreContext) []shared.TestRun {
+func getRuns(ctx wptStorage.GCSDatastoreContext) ([]*datastore.Key, []shared.TestRun) {
 	query := datastore.NewQuery("TestRun").Order("-CreatedAt")
+	keys := make([]*datastore.Key, 0)
 	testRuns := make([]shared.TestRun, 0)
 	it := ctx.Client.Run(ctx.Context, query)
 	for {
 		var testRun shared.TestRun
-		_, err := it.Next(&testRun)
+		key, err := it.Next(&testRun)
 		if err == iterator.Done {
 			break
 		}
 		if err != nil {
 			log.Fatal(err)
 		}
+		keys = append(keys, key)
 		testRuns = append(testRuns, testRun)
 	}
-	return testRuns
+	return keys, testRuns
 }
 
 func getGit(s storage.Storer, fs billy.Filesystem, o *git.CloneOptions) *git.Repository {
@@ -126,13 +120,14 @@ func getHashForRun(run shared.TestRun) (string, error) {
 	return strings.Trim(str, " \t\r\n\v"), nil
 }
 
-func getRunsAndSetupGit(ctx wptStorage.GCSDatastoreContext) []shared.TestRun {
+func getRunsAndSetupGit(ctx wptStorage.GCSDatastoreContext) ([]*datastore.Key, []shared.TestRun) {
 	var wg sync.WaitGroup
+	var keys []*datastore.Key
 	var runs []shared.TestRun
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		runs = getRuns(ctx)
+		keys, runs = getRuns(ctx)
 	}()
 	go func() {
 		defer wg.Done()
@@ -147,9 +142,10 @@ func getRunsAndSetupGit(ctx wptStorage.GCSDatastoreContext) []shared.TestRun {
 	}()
 	wg.Wait()
 
-	return runs
+	return keys, runs
 }
 
+// Currently dead code, but may be used later to batch update datastore entities missing new fields.
 func getHashes(runs []shared.TestRun) (map[string]string, map[string]error) {
 	errs := make(map[string]error)
 	hashes := make(map[string]string)
@@ -168,111 +164,6 @@ func getHashes(runs []shared.TestRun) (map[string]string, map[string]error) {
 	wg.Wait()
 
 	return hashes, errs
-}
-
-func loadResultShard(ctx context.Context, bucket *gcs.BucketHandle, run tr, objName string, resultChan chan interface{}, errChan chan error) {
-	// Read object from GCS.
-	obj := bucket.Object(objName)
-	reader, err := obj.NewReader(ctx)
-	if err != nil {
-		errChan <- err
-		return
-	}
-	defer reader.Close()
-	data, err := ioutil.ReadAll(reader)
-	if err != nil {
-		errChan <- err
-		return
-	}
-
-	// Unmarshal JSON, which may be gzipped.
-	var anyResult interface{}
-	if err := json.Unmarshal(data, &anyResult); err != nil {
-		reader2 := bytes.NewReader(data)
-		reader3, err := gzip.NewReader(reader2)
-		if err != nil {
-			errChan <- err
-			return
-		}
-		defer reader3.Close()
-		unzippedData, err := ioutil.ReadAll(reader3)
-		if err != nil {
-			errChan <- err
-			return
-		}
-		if err := json.Unmarshal(unzippedData, &anyResult); err != nil {
-			errChan <- err
-			return
-		}
-	}
-	resultChan <- anyResult
-}
-
-func loadResults(ctx context.Context, client *gcs.Client, bucket *gcs.BucketHandle, run tr) (chan interface{}, chan error) {
-	resultsURL := run.ResultsURL
-
-	// TODO(markdittmer): Below is almost verbatim from
-	// metrics/storage/storage.go. Perhaps refactor into common code path.
-
-	// summaryURL format:
-	//
-	// protocol://host/bucket/dir/path-summary.json.gz
-	//
-	// where results are stored in
-	//
-	// protocol://host/bucket/dir/path/**
-	//
-	// Desired bucket-relative GCS prefix:
-	//
-	// dir/path/
-	prefixSliceStart := strings.Index(resultsURL, *inputGcsBucket) +
-		len(*inputGcsBucket) + 1
-	prefixSliceEnd := strings.LastIndex(resultsURL, "-")
-	prefix := resultsURL[prefixSliceStart:prefixSliceEnd] + "/"
-
-	// Get objects with desired prefix, process them in parallel, then
-	// return.
-	it := bucket.Objects(ctx, &gcs.Query{
-		Prefix: prefix,
-	})
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	resultChan := make(chan interface{}, 0)
-	errChan := make(chan error, 0)
-
-	{
-		defer close(resultChan)
-		defer close(errChan)
-
-		for {
-			var err error
-			attrs, err := it.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				errChan <- err
-				continue
-			}
-
-			// Skip directories.
-			if attrs.Name == "" {
-				continue
-			}
-
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				loadResultShard(ctx, bucket, run, attrs.Name, resultChan, errChan)
-			}()
-		}
-
-		wg.Done()
-		wg.Wait()
-	}
-
-	return resultChan, errChan
 }
 
 func writeJSON(ctx context.Context, bucket *gcs.BucketHandle, path string, data interface{}) error {
@@ -365,10 +256,11 @@ func main() {
 	}
 
 	log.Printf("Loading runs from Datastore and initializing local web-platform-tests checkout")
-	testRuns := getRunsAndSetupGit(remoteCtx)
+	datastoreKeys, testRuns := getRunsAndSetupGit(remoteCtx)
 	outputBucket := storageClient.Bucket(*outputGcsBucket)
 
-	for _, testRun := range testRuns {
+	for i, testRun := range testRuns {
+		datastoreKey := datastoreKeys[i]
 		hash, err := getHashForRun(testRun)
 		if err != nil {
 			log.Printf("Skipping run for unknown revision: %v", testRun)
@@ -397,6 +289,7 @@ func main() {
 		}
 
 		// Download sharded run, consolidate it, upload consolidated run.
+		var remoteReportPath string
 		{
 			defer logFile.Close()
 			log.Printf("Downloading, consolidating, and uploading %v", testRun)
@@ -412,7 +305,7 @@ func main() {
 			}
 			report := metrics.TestResultsReport{results}
 
-			remoteReportPath := bucketDir + "/report.json"
+			remoteReportPath = bucketDir + "/report.json"
 			log.Printf("Writing consolidated results to %s/%s", *outputGcsBucket, remoteReportPath)
 			if err = writeJSON(ctx, outputBucket, remoteReportPath, report); err != nil {
 				log.Printf("Error writing %s to Google Cloud Storage: %v\n", remoteReportPath, err)
@@ -421,6 +314,17 @@ func main() {
 			}
 
 			log.SetOutput(os.Stdout)
+		}
+
+		// Update TestRun in Datastore.
+		if testRun.RevisionHash == nil {
+			testRun.RevisionHash = &hash
+			rawResultsURL := fmt.Sprintf("https://storage.googleapis.com/%s/%s", *outputGcsBucket, remoteReportPath)
+			testRun.RawResultsURL = &rawResultsURL
+			_, err := datastoreClient.Put(ctx, datastoreKey, testRun)
+			if err != nil {
+				log.Fatal(err)
+			}
 		}
 
 		// Re-open local log file for streaming to GCS.
