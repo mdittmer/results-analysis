@@ -255,97 +255,107 @@ func main() {
 		datastoreClient,
 	}
 
-	log.Printf("Loading runs from Datastore and initializing local web-platform-tests checkout")
-	datastoreKeys, testRuns := getRunsAndSetupGit(remoteCtx)
-	outputBucket := storageClient.Bucket(*outputGcsBucket)
+	// Forever: Reload wpt revisions and runs; skip handled runs; handle one run;
+	// repeat.
+	for {
+		log.Printf("Loading runs from Datastore and initializing local web-platform-tests checkout")
+		datastoreKeys, testRuns := getRunsAndSetupGit(remoteCtx)
+		outputBucket := storageClient.Bucket(*outputGcsBucket)
 
-	for i, testRun := range testRuns {
-		datastoreKey := datastoreKeys[i]
-		hash, err := getHashForRun(testRun)
-		if err != nil {
-			log.Printf("Skipping run for unknown revision: %v", testRun)
-			continue
-		}
-
-		// Check for remote log file as signal that this run was already handled.
-		log.Printf("Checking for existing consolidated run for %v", testRun)
-		bucketDir := fmt.Sprintf("%s/%s_%s_%s_%s", hash, testRun.BrowserName, testRun.BrowserVersion, testRun.OSName, testRun.OSVersion)
-		remoteLogPath := bucketDir + "/migration.log"
-		_, err = outputBucket.Object(remoteLogPath).Attrs(ctx)
-		if err != nil && err != gcs.ErrObjectNotExist {
-			log.Fatal(err)
-		}
-		if err == nil {
-			log.Printf("Skipping revision: Found log file for revision: %v", testRun)
-			continue
-		}
-
-		// Create local log file for this run.
-		localLogFileName := fmt.Sprintf("%s_%s_%s_%s_%s_migration.log", hash, testRun.BrowserName, testRun.BrowserVersion, testRun.OSName, testRun.OSVersion)
-		log.Printf("Opening local run-specific log file %s", localLogFileName)
-		logFile, err := os.OpenFile(localLogFileName, os.O_CREATE|os.O_WRONLY, 0666)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// Download sharded run, consolidate it, upload consolidated run.
-		var remoteReportPath string
-		{
-			defer logFile.Close()
-			log.Printf("Downloading, consolidating, and uploading %v", testRun)
-			log.Printf("Logging to %s", localLogFileName)
-			log.SetOutput(logFile)
-
-			log.Printf("Loading results from %s for %v", remoteCtx.Bucket.Name, testRun)
-			runResults := wptStorage.LoadTestRunResults(&remoteCtx, []shared.TestRun{testRun}, nil, false)
-			log.Printf("Consolidating metrics for %v", testRun)
-			results := make([]*metrics.TestResults, 0, len(runResults))
-			for _, rr := range runResults {
-				results = append(results, rr.Res)
-			}
-			report := metrics.TestResultsReport{results}
-
-			remoteReportPath = bucketDir + "/report.json"
-			log.Printf("Writing consolidated results to %s/%s", *outputGcsBucket, remoteReportPath)
-			if err = writeJSON(ctx, outputBucket, remoteReportPath, report); err != nil {
-				log.Printf("Error writing %s to Google Cloud Storage: %v\n", remoteReportPath, err)
-				log.SetOutput(os.Stdout)
+		for i, testRun := range testRuns {
+			datastoreKey := datastoreKeys[i]
+			hash, err := getHashForRun(testRun)
+			if err != nil {
+				log.Printf("Skipping run for unknown revision: %v", testRun)
 				continue
 			}
 
-			log.SetOutput(os.Stdout)
-		}
+			// Check for remote log file as signal that this run was already handled.
+			log.Printf("Checking for existing consolidated run for %v", testRun)
+			bucketDir := fmt.Sprintf("%s/%s_%s_%s_%s", hash, testRun.BrowserName, testRun.BrowserVersion, testRun.OSName, testRun.OSVersion)
+			remoteLogPath := bucketDir + "/migration.log"
+			_, err = outputBucket.Object(remoteLogPath).Attrs(ctx)
+			if err != nil && err != gcs.ErrObjectNotExist {
+				log.Fatal(err)
+			}
+			if err == nil {
+				log.Printf("Skipping revision: Found log file for revision: %v", testRun)
+				continue
+			}
 
-		// Update TestRun in Datastore.
-		if testRun.RevisionHash == "" {
-			testRun.RevisionHash = hash
-			testRun.RawResultsURL = fmt.Sprintf("https://storage.googleapis.com/%s/%s", *outputGcsBucket, remoteReportPath)
-			_, err := datastoreClient.Put(ctx, datastoreKey, testRun)
+			// Create local log file for this run.
+			localLogFileName := fmt.Sprintf("%s_%s_%s_%s_%s_migration.log", hash, testRun.BrowserName, testRun.BrowserVersion, testRun.OSName, testRun.OSVersion)
+			log.Printf("Opening local run-specific log file %s", localLogFileName)
+			logFile, err := os.OpenFile(localLogFileName, os.O_CREATE|os.O_WRONLY, 0666)
 			if err != nil {
 				log.Fatal(err)
 			}
-		}
 
-		// Re-open local log file for streaming to GCS.
-		log.Printf("Opening %s for reading", localLogFileName)
-		logFile, err = os.OpenFile(localLogFileName, os.O_RDONLY, 0666)
-		if err != nil {
-			log.Fatal(err)
-		}
+			// Download sharded run, consolidate it, upload consolidated run.
+			var remoteReportPath string
+			{
+				defer logFile.Close()
+				log.Printf("Downloading, consolidating, and uploading %v", testRun)
+				log.Printf("Logging to %s", localLogFileName)
+				log.SetOutput(logFile)
 
-		// Stream log file to GCS.
-		{
-			defer logFile.Close()
-			log.Printf("Streaming %s to GCS object: %s", localLogFileName, remoteLogPath)
-			if err := streamData(ctx, outputBucket, remoteLogPath, logFile); err != nil {
-				log.Printf("Error streaming log to Google Cloud Storage: %v\n", err)
+				log.Printf("Loading results from %s for %v", remoteCtx.Bucket.Name, testRun)
+				runResults := wptStorage.LoadTestRunResults(&remoteCtx, []shared.TestRun{testRun}, nil, false)
+				log.Printf("Consolidating metrics for %v", testRun)
+				results := make([]*metrics.TestResults, 0, len(runResults))
+				for _, rr := range runResults {
+					results = append(results, rr.Res)
+				}
+				report := metrics.TestResultsReport{results}
+
+				remoteReportPath = bucketDir + "/report.json"
+				log.Printf("Writing consolidated results to %s/%s", *outputGcsBucket, remoteReportPath)
+				if err = writeJSON(ctx, outputBucket, remoteReportPath, report); err != nil {
+					log.Printf("Error writing %s to Google Cloud Storage: %v\n", remoteReportPath, err)
+					log.SetOutput(os.Stdout)
+					continue
+				}
+
+				log.SetOutput(os.Stdout)
 			}
-			if err := logFile.Close(); err != nil {
+
+			// Update TestRun in Datastore.
+			rawResultsURL := fmt.Sprintf("https://storage.googleapis.com/%s/%s", *outputGcsBucket, remoteReportPath)
+			if testRun.FullRevisionHash != hash || testRun.RawResultsURL != rawResultsURL {
+				testRun.FullRevisionHash = hash
+				testRun.RawResultsURL = rawResultsURL
+				log.Printf("Updating datastore TestRun key=%v FullRevisionHash=%s RawResultsURL=%s", datastoreKey, testRun.FullRevisionHash, testRun.RawResultsURL)
+				_, err := datastoreClient.Put(ctx, datastoreKey, testRun)
+				if err != nil {
+					log.Fatal(err)
+				}
+			}
+
+			// Re-open local log file for streaming to GCS.
+			log.Printf("Opening %s for reading", localLogFileName)
+			logFile, err = os.OpenFile(localLogFileName, os.O_RDONLY, 0666)
+			if err != nil {
 				log.Fatal(err)
 			}
-		}
 
-		// Wait a minute to avoid being throttled by GCS.
-		time.Sleep(time.Minute)
+			// Stream log file to GCS.
+			{
+				defer logFile.Close()
+				log.Printf("Streaming %s to GCS object: %s", localLogFileName, remoteLogPath)
+				if err := streamData(ctx, outputBucket, remoteLogPath, logFile); err != nil {
+					log.Printf("Error streaming log to Google Cloud Storage: %v\n", err)
+				}
+				if err := logFile.Close(); err != nil {
+					log.Fatal(err)
+				}
+			}
+
+			// Wait a minute to avoid being throttled by GCS.
+			time.Sleep(time.Minute)
+
+			// Jump to outer loop to reload latest revisions and test runs that may
+			// have landed in the meantime.
+			break
+		}
 	}
 }
