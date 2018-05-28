@@ -269,6 +269,7 @@ func main() {
 				log.Printf("Skipping run for unknown revision: %v", testRun)
 				continue
 			}
+			rawResultsURL := fmt.Sprintf("https://storage.googleapis.com/%s/%s", *outputGcsBucket, remoteReportPath)
 
 			// Check for remote log file as signal that this run was already handled.
 			log.Printf("Checking for existing consolidated run for %v", testRun)
@@ -279,6 +280,16 @@ func main() {
 				log.Fatal(err)
 			}
 			if err == nil {
+				// Update TestRun in Datastore.
+				if testRun.FullRevisionHash != hash || testRun.RawResultsURL != rawResultsURL {
+					testRun.FullRevisionHash = hash
+					testRun.RawResultsURL = rawResultsURL
+					log.Printf("Updating datastore TestRun key=%v FullRevisionHash=%s RawResultsURL=%s", datastoreKey, testRun.FullRevisionHash, testRun.RawResultsURL)
+					_, err := datastoreClient.Put(ctx, datastoreKey, &testRun)
+					if err != nil {
+						log.Fatal(err)
+					}
+				}
 				log.Printf("Skipping revision: Found log file for revision: %v", testRun)
 				continue
 			}
@@ -320,7 +331,6 @@ func main() {
 			}
 
 			// Update TestRun in Datastore.
-			rawResultsURL := fmt.Sprintf("https://storage.googleapis.com/%s/%s", *outputGcsBucket, remoteReportPath)
 			if testRun.FullRevisionHash != hash || testRun.RawResultsURL != rawResultsURL {
 				testRun.FullRevisionHash = hash
 				testRun.RawResultsURL = rawResultsURL
