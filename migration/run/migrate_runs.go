@@ -269,13 +269,13 @@ func main() {
 				log.Printf("Skipping run for unknown revision: %v", testRun)
 				continue
 			}
+			bucketDir := fmt.Sprintf("%s/%s_%s_%s_%s", hash, testRun.BrowserName, testRun.BrowserVersion, testRun.OSName, testRun.OSVersion)
+			remoteLogPath := bucketDir + "/migration.log"
+			remoteReportPath := bucketDir + "/report.json"
 			rawResultsURL := fmt.Sprintf("https://storage.googleapis.com/%s/%s", *outputGcsBucket, remoteReportPath)
 
 			// Check for remote log file as signal that this run was already handled.
 			log.Printf("Checking for existing consolidated run for %v", testRun)
-			bucketDir := fmt.Sprintf("%s/%s_%s_%s_%s", hash, testRun.BrowserName, testRun.BrowserVersion, testRun.OSName, testRun.OSVersion)
-			remoteLogPath := bucketDir + "/migration.log"
-			remoteReportPath := bucketDir + "/report.json"
 			_, err = outputBucket.Object(remoteLogPath).Attrs(ctx)
 			if err != nil && err != gcs.ErrObjectNotExist {
 				log.Fatal(err)
