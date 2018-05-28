@@ -275,6 +275,7 @@ func main() {
 			log.Printf("Checking for existing consolidated run for %v", testRun)
 			bucketDir := fmt.Sprintf("%s/%s_%s_%s_%s", hash, testRun.BrowserName, testRun.BrowserVersion, testRun.OSName, testRun.OSVersion)
 			remoteLogPath := bucketDir + "/migration.log"
+			remoteReportPath := bucketDir + "/report.json"
 			_, err = outputBucket.Object(remoteLogPath).Attrs(ctx)
 			if err != nil && err != gcs.ErrObjectNotExist {
 				log.Fatal(err)
@@ -303,7 +304,6 @@ func main() {
 			}
 
 			// Download sharded run, consolidate it, upload consolidated run.
-			var remoteReportPath string
 			{
 				defer logFile.Close()
 				log.Printf("Downloading, consolidating, and uploading %v", testRun)
@@ -319,7 +319,6 @@ func main() {
 				}
 				report := metrics.TestResultsReport{results}
 
-				remoteReportPath = bucketDir + "/report.json"
 				log.Printf("Writing consolidated results to %s/%s", *outputGcsBucket, remoteReportPath)
 				if err = writeJSON(ctx, outputBucket, remoteReportPath, report); err != nil {
 					log.Printf("Error writing %s to Google Cloud Storage: %v\n", remoteReportPath, err)
