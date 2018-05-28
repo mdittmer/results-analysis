@@ -313,7 +313,7 @@ func main() {
 				if err = writeJSON(ctx, outputBucket, remoteReportPath, report); err != nil {
 					log.Printf("Error writing %s to Google Cloud Storage: %v\n", remoteReportPath, err)
 					log.SetOutput(os.Stdout)
-					continue
+					log.Fatal(err)
 				}
 
 				log.SetOutput(os.Stdout)
@@ -325,7 +325,7 @@ func main() {
 				testRun.FullRevisionHash = hash
 				testRun.RawResultsURL = rawResultsURL
 				log.Printf("Updating datastore TestRun key=%v FullRevisionHash=%s RawResultsURL=%s", datastoreKey, testRun.FullRevisionHash, testRun.RawResultsURL)
-				_, err := datastoreClient.Put(ctx, datastoreKey, testRun)
+				_, err := datastoreClient.Put(ctx, datastoreKey, &testRun)
 				if err != nil {
 					log.Fatal(err)
 				}
