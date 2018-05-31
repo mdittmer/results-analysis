@@ -274,18 +274,12 @@ func main() {
 			remoteReportPath := bucketDir + "/report.json"
 			rawResultsURL := fmt.Sprintf("https://storage.googleapis.com/%s/%s", *outputGcsBucket, remoteReportPath)
 
-			// Check for remote log file as signal that this run was already handled.
-			log.Printf("Checking for existing consolidated run for %v", testRun)
-			_, err = outputBucket.Object(remoteLogPath).Attrs(ctx)
-			if err != nil && err != gcs.ErrObjectNotExist {
-				log.Fatal(err)
-			}
-			if err == nil {
-				// Update TestRun in Datastore.
-				if testRun.FullRevisionHash != hash || testRun.RawResultsURL != rawResultsURL {
+			// Check RawResultsURL as indicator that run was already handled.
+			if testRun.RawResultsURL != "" {
+				// Update FullRevisionHash in Datastore.
+				if testRun.FullRevisionHash != hash {
 					testRun.FullRevisionHash = hash
-					testRun.RawResultsURL = rawResultsURL
-					log.Printf("Updating datastore TestRun key=%v FullRevisionHash=%s RawResultsURL=%s", datastoreKey, testRun.FullRevisionHash, testRun.RawResultsURL)
+					log.Printf("Updating datastore TestRun key=%v FullRevisionHash=%s", datastoreKey, testRun.FullRevisionHash)
 					_, err := datastoreClient.Put(ctx, datastoreKey, &testRun)
 					if err != nil {
 						log.Fatal(err)
@@ -329,17 +323,6 @@ func main() {
 				log.SetOutput(os.Stdout)
 			}
 
-			// Update TestRun in Datastore.
-			if testRun.FullRevisionHash != hash || testRun.RawResultsURL != rawResultsURL {
-				testRun.FullRevisionHash = hash
-				testRun.RawResultsURL = rawResultsURL
-				log.Printf("Updating datastore TestRun key=%v FullRevisionHash=%s RawResultsURL=%s", datastoreKey, testRun.FullRevisionHash, testRun.RawResultsURL)
-				_, err := datastoreClient.Put(ctx, datastoreKey, &testRun)
-				if err != nil {
-					log.Fatal(err)
-				}
-			}
-
 			// Re-open local log file for streaming to GCS.
 			log.Printf("Opening %s for reading", localLogFileName)
 			logFile, err = os.OpenFile(localLogFileName, os.O_RDONLY, 0666)
@@ -355,6 +338,17 @@ func main() {
 					log.Printf("Error streaming log to Google Cloud Storage: %v\n", err)
 				}
 				if err := logFile.Close(); err != nil {
+					log.Fatal(err)
+				}
+			}
+
+			// Update TestRun in Datastore.
+			if testRun.FullRevisionHash != hash || testRun.RawResultsURL != rawResultsURL {
+				testRun.FullRevisionHash = hash
+				testRun.RawResultsURL = rawResultsURL
+				log.Printf("Updating datastore TestRun key=%v FullRevisionHash=%s RawResultsURL=%s", datastoreKey, testRun.FullRevisionHash, testRun.RawResultsURL)
+				_, err := datastoreClient.Put(ctx, datastoreKey, &testRun)
+				if err != nil {
 					log.Fatal(err)
 				}
 			}
