@@ -192,8 +192,8 @@ func SubTestStatusName(ts SubTestStatus) string {
 
 // CompleteTestStatus binds a TestStatus to a SubTestStatus.
 type CompleteTestStatus struct {
-	Status    TestStatus
-	SubStatus SubTestStatus
+	Status    TestStatus    `json:"status"`
+	SubStatus SubTestStatus `json:"sub_status,omitempty"`
 }
 
 // TestRunStatus binds a TestRun to a CompleteTestStatus.
